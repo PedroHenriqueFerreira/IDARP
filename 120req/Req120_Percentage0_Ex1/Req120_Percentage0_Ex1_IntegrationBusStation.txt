@@ -1,0 +1,3 @@
+Number-Of-Integrations
+0
+k	n+k	Line	Bus	i	j	BoardingTime	LandingTime	:	cod(k)		cod(n+k)	cod(i)		cod(j)

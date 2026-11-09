@@ -1,0 +1,18 @@
+Number-Of-Integrations
+15
+Req	Cost	Mode
+6	23.44	Integrated
+7	46.76	Integrated
+8	23.22	Extra
+13	16.4	Integrated
+16	11.1	Integrated
+19	11.62	Integrated
+21	10.28	Extra
+27	27.86	Extra
+28	25.76	Extra
+29	23.44	Extra
+30	22.2	Integrated
+31	6.24	Extra
+50	6.14	Extra
+51	7.96	Extra
+58	23	Extra
