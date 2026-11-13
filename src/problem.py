@@ -10,10 +10,10 @@ class Node:
     code: str
     x: float  # Longitude
     y: float  # Latitude
-    service_time: float  # Seconds
+    service_time: int  # Seconds
     demand: int  # Passengers (pickup +1, delivery -1)
-    ready_time: float  # Seconds
-    due_time: float  # Seconds
+    ready_time: int  # Seconds
+    due_time: int  # Seconds
     allowed_to_integrate: bool
 
 @dataclass
@@ -36,7 +36,6 @@ class BusLine:
     route: str  # Column "Line" of the file (e.g. 'L2')
     name: str  # Column "Name" of the file (e.g. 'Sainte-Foy_centre')
     trips: list[BusTrip] = field(default_factory=list)
-
 
 @dataclass
 class Integration:
@@ -76,7 +75,7 @@ class Problem:
 
     def __init__(self, folder: str, precision: int = 2, tighten_time_windows: bool = True):
         self.folder = Path(folder).resolve()  # Instance folder
-        self.precision = precision  # Number of decimal places kept (values scaled by 10 ** precision)
+        self.precision = precision  # Number of decimal places kept
         self.tighten_time_windows = tighten_time_windows # Whether to tighten DARP time windows
 
         # Codes file
@@ -109,6 +108,16 @@ class Problem:
         self.integrations: dict[int, Integration] = {}
 
         self._load()
+
+    def __repr__(self):
+        return (
+            f'Problem::{self.folder.name}'
+            f'({self.requests} requests, '
+            f'{self.vehicles} vehicles, '
+            f'{len(self.bus_stops)} bus_stops, '
+            f'{len(self.bus_lines)} bus_lines, '
+            f'{len(self.integrations)} integrations)'
+        )
 
     # Helpers
 
@@ -154,8 +163,8 @@ class Problem:
             
             self.codes.append(code)
 
-        if len(self.codes) != count:
-            raise ValueError(f'Codes file: declared {count} elements, found {len(self.codes)}')
+        assert len(self.codes) == count, \
+            f'Codes file: declared {count} elements, found {len(self.codes)}'
 
     def _load_darp(self): # OK
         ''' DARP file: configuration + nodes '''
@@ -216,7 +225,10 @@ class Problem:
     def _load_bus_lines(self): # OK
         ''' BusLines file: one row per (line, bus, stop) '''
 
-        # Number-Of-Lines / n, Number-Of-Bus-Per-Line / ..., Number-Of-Bus-Station-Per-Line / ..., header, rows
+        # Number-Of-Lines / n, 
+        # Number-Of-Bus-Per-Line / ..., 
+        # Number-Of-Bus-Station-Per-Line / ..., 
+        # header, rows...
         
         lines = self._read_lines('BusLines')
         
@@ -226,7 +238,8 @@ class Problem:
         stops_per_line = list(map(int, lines[5].split()))
         columns = lines[6].split()
 
-        trips: dict[tuple[int, int], tuple[list[int], list[int]]] = {}  # (line, bus) -> (stop ids, times)
+        # (line, bus) -> (stop ids, times)
+        trips: dict[tuple[int, int], tuple[list[int], list[int]]] = {}  
         
         for line in lines[7:]:
             row = dict(zip(columns, line.split()))
@@ -374,13 +387,3 @@ class Problem:
                 delivery.due_time,
                 pickup.due_time + pickup.service_time + self.max_ride_time
             )
-
-    def __repr__(self):
-        return (
-            f'Problem_{self.folder.name}'
-            f'({self.requests} requests, '
-            f'{self.vehicles} vehicles, '
-            f'{len(self.bus_stops)} bus stops, '
-            f'{len(self.bus_lines)} bus lines, '
-            f'{len(self.integrations)} integrations)'
-        )
