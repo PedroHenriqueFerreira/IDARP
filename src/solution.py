@@ -140,3 +140,4 @@ class Solution:
             self.costs.carrier_per_km * (first + last) / 10 ** self.problem.precision + \
             self.costs.bus_ticket
         )
+        
