@@ -59,19 +59,18 @@ class Solution:
         # Private fleet (shared vehicles)
         used_routes = [route for route in self.routes if route.nodes]
                 
-        assert len(set(route_nodes)) == len(route_nodes), 'Duplicate nodes found in routes'
-        assert len(used_routes) <= self.problem.vehicles, 'Maximum number of vehicles exceeded'
-        assert all(route.feasible for route in used_routes), 'One or more routes are not feasible'
+        assert len(set(route_nodes)) == len(route_nodes)
+        assert len(used_routes) <= self.problem.vehicles
+        assert all(route.feasible for route in used_routes)
     
         # Common carrier (direct trips)
         for k in self.carrier_requests:
-            assert k in all_requests, f'Invalid carrier request: {k}'
+            assert k in all_requests
                                 
             pickup, delivery = self.problem.nodes[k], self.problem.nodes[k + self.problem.requests]
             direct = self.problem.times_cc[k, k + self.problem.requests]
     
-            assert pickup.ready_time + pickup.service_time + direct <= delivery.due_time, \
-                f'Request {k} cannot be served by the common carrier'
+            assert pickup.ready_time + pickup.service_time + direct <= delivery.due_time
 
         # Bus integration (first mile by carrier, bus, last mile by carrier)
         for k in self.integrated_requests:
@@ -85,33 +84,26 @@ class Solution:
             # (1) First mile
             first_mile = problem.times[k, integration.boarding_stop]
             latest_pickup = min(pickup.due_time, integration.boarding_time - pickup.service_time - first_mile)
-            assert pickup.ready_time <= latest_pickup, \
-                f'Request {k} cannot be served by the bus integration'
+            assert pickup.ready_time <= latest_pickup
     
             # (2) Last mile
             last_mile = problem.times[integration.landing_stop, k + n]
             arrival = max(integration.landing_time + last_mile, delivery.ready_time)
-            assert arrival <= delivery.due_time, \
-                f'Request {k} cannot be served by the bus integration'
-    
+            assert arrival <= delivery.due_time
+
             # (3) Ride time
-            assert arrival - latest_pickup - pickup.service_time <= problem.max_ride_time, \
-                f'Request {k} cannot be served by the bus integration due to ride time'
-            
+            assert arrival - latest_pickup - pickup.service_time <= problem.max_ride_time
+
         # Every request served exactly once
         requests = [*private_requests, *self.carrier_requests, *self.integrated_requests]
 
-        assert len(requests) == len(set(requests)), 'Request served by more than one mode'
-        assert all_requests == set(requests), 'Requests served do not match all requests'
+        assert len(requests) == len(set(requests))
+        assert all_requests == set(requests)
     
     @property
     def cost(self) -> float:
         if self._cost is None:
-            private_cost = self._private_cost()
-            carrier_cost = sum(self._request_carrier_cost(k) for k in self.carrier_requests)
-            integration_cost = sum(self._request_integration_cost(k) for k in self.integrated_requests)
-            
-            self._cost = private_cost + carrier_cost + integration_cost
+            self._cost = self._private_cost() + self._carrier_cost() + self._integration_cost()
 
         return self._cost
 
@@ -120,24 +112,34 @@ class Solution:
         total_distance = sum(r.distance for r in self.routes) / 10 ** self.problem.precision
         return self.costs.private_per_km * total_distance
 
-    def _request_carrier_cost(self, k: int) -> float:
-        ''' Cost of serving request `k` with the common carrier: f + v * d(k, n+k) '''
-        distance = self.problem.distances_cc[k, k + self.problem.requests] / 10 ** self.problem.precision
-        return self.costs.carrier_fixed + self.costs.carrier_per_km * distance
+    def _carrier_cost(self) -> float:
+        ''' Cost of serving all requests `k` with the common carrier: f + v * d(k, n+k) '''
+        
+        total_cost = 0.0
+        
+        for k in self.carrier_requests:
+            distance = self.problem.distances_cc[k, k + self.problem.requests] / self.problem.scale
+            total_cost += self.costs.carrier_fixed + self.costs.carrier_per_km * distance
+        
+        return total_cost
 
-    def _request_integration_cost(self, k: int) -> float:
-        ''' Cost of serving request `k` with its bus integration:
+    def _integration_cost(self, k: int) -> float:
+        ''' Cost of serving all requests `k` with its bus integration:
         - [f + v * d(k, board)] + p_l + [f + v * d(land, n+k)].
         '''
         
-        integration = self.problem.integrations[k]
+        total_cost = 0.0
         
-        first = self.problem.distances[k, integration.boarding_stop]
-        last = self.problem.distances[integration.landing_stop, k + self.problem.requests]
+        for k in self.integrated_requests:
+            integration = self.problem.integrations[k]
+            
+            first = self.problem.distances[k, integration.boarding_stop]
+            last = self.problem.distances[integration.landing_stop, k + self.problem.requests]
 
-        return (
-            2 * self.costs.carrier_fixed + \
-            self.costs.carrier_per_km * (first + last) / 10 ** self.problem.precision + \
-            self.costs.bus_ticket
-        )
-        
+            total_cost += (
+                2 * self.costs.carrier_fixed + \
+                self.costs.carrier_per_km * (first + last) / self.problem.scale + \
+                self.costs.bus_ticket
+            )
+
+        return total_cost

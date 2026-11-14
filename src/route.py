@@ -5,15 +5,10 @@ from typing import Generator
 from src.problem import Problem, Node
 
 class Route:
-    ''' Class representing a private fleet vehicle route of the IDARP.
+    ''' Class representing a private fleet vehicle route.
 
-    The route is the ordered list of node ids visited between the depot (start) and the depot
-    (end). The end depot is node 0 as well. A route only holds requests served by the private
-    fleet: both the pickup and the delivery of each request must be in the same route.
-
-    Two different matrices are used:
-      - `problem.times` (seconds): feasibility (time windows, ride time, route duration);
-      - `problem.distances` (km): the quantity that is paid (see `Siolution` for the cost).
+    The route is the ordered list of node ids visited between the depot (start) and the depot (end). 
+    The pickup and the delivery of each request must be in the same route.
     '''
 
     def __init__(self, problem: Problem, nodes: list[int]):
@@ -36,24 +31,13 @@ class Route:
         return self.problem.nodes[self.nodes[index]]
 
     @property
-    def requests(self) -> set[int]:
-        ''' Requests (pickup ids) served by this route '''
-        n = self.problem.requests
-        return {id for id in self.nodes if id <= n}
-
-    @property
     def distance(self) -> int:
         ''' Total distance of the route (km, scaled by 10 ** precision) '''
         if self._distance is None:
             self._distance = 0
 
             self._distance += self.problem.distances[0, self.nodes[0]]  # depot to first node
-
-            self._distance = sum(
-                self.problem.distances[a, b] 
-                for a, b in zip(self.nodes, self.nodes[1:])
-            )
-            
+            self._distance = sum(self.problem.distances[a, b] for a, b in zip(self.nodes, self.nodes[1:]))
             self._distance += self.problem.distances[self.nodes[-1], 0]  # last node to depot
 
         return self._distance
@@ -68,20 +52,22 @@ class Route:
 
     @property
     def feasible(self) -> bool:
-        ''' Validates the route's feasibility using bound propagation for the Simple Temporal Problem (STP). This approach mathematically guarantees to find a valid schedule if one exists, distributing waiting times correctly to protect the passenger's ride time. '''
+        ''' Validates the route's feasibility using bound propagation for the Simple Temporal Problem (STP). 
+        
+        This approach mathematically guarantees to find a valid schedule if one exists, distributing waiting times correctly to protect the passenger's ride time. 
+        '''
 
         if self._feasible is not None:
             return self._feasible
         
         n = self.problem.requests
-        
         if any(node < 1 or node > 2 * n for node in self.nodes):
             return self.set_unfeasible()
 
         pos = { id: i for i, id in enumerate(self.nodes) }
 
         # Precedence check (pickup before delivery)
-        
+
         if any(id + n not in self.nodes or pos[id] > pos[id + n] for id in self.nodes if id <= n):
             return self.set_unfeasible()
 

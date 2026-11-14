@@ -73,7 +73,7 @@ class Problem:
 
     def __init__(self, folder: str, precision: int = 2, tighten_time_windows: bool = True):
         self.folder = Path(folder).resolve()  # Instance folder
-        self.precision = precision  # Number of decimal places kept
+        self.scale: int = 10 ** precision   # Scale factor for time and distance values
         self.tighten_time_windows = tighten_time_windows # Whether to tighten DARP time windows
 
         # Codes file
@@ -118,10 +118,10 @@ class Problem:
     # Helpers
 
     def _scale_value(self, value: str) -> int:
-        return int(round(float(value) * 10 ** self.precision))
+        return int(round(float(value) * self.scale))
 
     def _scale_matrix(self, matrix: np.ndarray) -> np.ndarray:
-        return np.rint(matrix * 10 ** self.precision).astype(np.int64)
+        return np.rint(matrix * self.scale).astype(np.int64)
 
     def _read_lines(self, suffix: str) -> list[str]: # OK
         ''' Non-empty, stripped lines of <folder>/<name>_<suffix>.txt '''
