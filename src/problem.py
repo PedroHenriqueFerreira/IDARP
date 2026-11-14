@@ -49,6 +49,18 @@ class Integration:
     cost: float | None = None 
     mode: str | None = None
 
+@dataclass(frozen=True)
+class CostScheme:
+    ''' Cost parameters.
+    
+    The defaults are the Québec City values of the paper (Schenekemberg et al. 2025)
+    '''
+    
+    private_per_km: float = 0.4 # Private fleet: cost per km traveled
+    carrier_fixed: float = 3.0 # Common carrier: fixed cost f per request
+    carrier_per_km: float = 2.0 # Common carrier: variable cost v per km
+    bus_ticket: float = 3.0 # Bus ticket p_l per integrated request
+
 class Problem:
     ''' Class representing a DARP-PFCC instance integrated with public transportation (IDARP).
 
@@ -71,10 +83,15 @@ class Problem:
     All time and distance values are stored as integers scaled by 10 ** precision.
     '''
 
-    def __init__(self, folder: str, precision: int = 2, tighten_time_windows: bool = True):
+    def __init__(
+        self, 
+        folder: str, 
+        precision: int = 2, 
+        costs = CostScheme()
+    ):
         self.folder = Path(folder).resolve()  # Instance folder
         self.scale: int = 10 ** precision   # Scale factor for time and distance values
-        self.tighten_time_windows = tighten_time_windows # Whether to tighten DARP time windows
+        self.costs = CostScheme()
 
         # Codes file
         self.codes: list[str] = []  # codes[id] for every element
@@ -123,7 +140,7 @@ class Problem:
     def _scale_matrix(self, matrix: np.ndarray) -> np.ndarray:
         return np.rint(matrix * self.scale).astype(np.int64)
 
-    def _read_lines(self, suffix: str) -> list[str]: # OK
+    def _read_lines(self, suffix: str) -> list[str]:
         ''' Non-empty, stripped lines of <folder>/<name>_<suffix>.txt '''
         
         path = self.folder / f'{self.folder.name}_{suffix}.txt'
@@ -143,10 +160,9 @@ class Problem:
         self._load_bus_lines()
         self._load_integrations()
 
-        if self.tighten_time_windows:
-            self._tighten_time_windows()
+        self._tighten_time_windows()
 
-    def _load_codes(self): # OK
+    def _load_codes(self):
         ''' Loads the Codes file. '''
 
         lines = self._read_lines('Codes') 
@@ -161,7 +177,7 @@ class Problem:
 
         assert len(self.codes) == count
 
-    def _load_darp(self): # OK
+    def _load_darp(self):
         ''' DARP file: configuration + nodes '''
 
         lines = self._read_lines('DARP')
@@ -309,7 +325,7 @@ class Problem:
 
         return matrix
 
-    def _read_square_matrix(self, suffix: str) -> np.ndarray: # OK
+    def _read_square_matrix(self, suffix: str) -> np.ndarray:
         ''' TimeBC / DistBC: first line is the size, then size rows with no labels '''
 
         lines = self._read_lines(suffix)
@@ -322,7 +338,7 @@ class Problem:
 
     # Preprocessing
 
-    def _tighten_time_windows(self): # OK
+    def _tighten_time_windows(self): 
         ''' Time window tightening, using the time matrix as travel time. '''
 
         for i in range(1, self.requests + 1):
@@ -346,3 +362,63 @@ class Problem:
                 delivery.due_time,
                 pickup.due_time + pickup.service_time + self.max_ride_time
             )
+
+    # Utils
+
+    def carrier_feasible(self, k: int) -> bool:
+        ''' Whether request `k` can be served by a direct common carrier trip. '''
+
+        pickup, delivery = self.nodes[k], self.nodes[k + self.requests]
+        direct = self.times_cc[k, k + self.requests]
+        return pickup.ready_time + pickup.service_time + direct <= delivery.due_time
+
+    def carrier_cost(self, k: int) -> float:
+        ''' Cost of serving request `k` with the common carrier: 
+        - f + v * d(k, n+k) 
+        '''
+
+        distance = self.distances_cc[k, k + self.requests] / self.scale
+        return self.costs.carrier_fixed + self.costs.carrier_per_km * distance
+
+    def integration_feasible(self, k: int) -> bool:
+        ''' Whether request `k` can be served by its bus integration. '''
+
+        integration = self.integrations.get(k)
+
+        if integration is None or not self.nodes[k].allowed_to_integrate:
+            return False
+
+        pickup, delivery = self.nodes[k], self.nodes[k + self.requests]
+
+        # (1) First mile
+        first_mile = self.times[k, integration.boarding_stop]
+        latest_pickup = min(pickup.due_time, integration.boarding_time - pickup.service_time - first_mile)
+
+        if pickup.ready_time > latest_pickup:
+            return False
+
+        # (2) Last mile
+        last_mile = self.times[integration.landing_stop, k + self.requests]
+        arrival = max(integration.landing_time + last_mile, delivery.ready_time)
+
+        if arrival > delivery.due_time:
+            return False
+
+        # (3) Ride time
+        return arrival - latest_pickup - pickup.service_time <= self.max_ride_time
+
+    def integration_cost(self, k: int) -> float:
+        ''' Cost of serving request `k` with its bus integration:
+        - [f + v * d(k, board)] + p_l + [f + v * d(land, n+k)].
+        '''
+
+        integration = self.integrations[k]
+
+        first = self.distances[k, integration.boarding_stop]
+        last = self.distances[integration.landing_stop, k + self.requests]
+
+        return (
+            2 * self.costs.carrier_fixed
+            + self.costs.carrier_per_km * (first + last) / self.scale
+            + self.costs.bus_ticket
+        )

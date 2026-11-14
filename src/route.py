@@ -30,17 +30,21 @@ class Route:
     def __getitem__(self, index: int) -> Node:
         return self.problem.nodes[self.nodes[index]]
 
+    def cost(self):
+        return self.problem.costs.private_per_km * self.distance
+
     @property
     def distance(self) -> int:
         ''' Total distance of the route (km, scaled by 10 ** precision) '''
         if self._distance is None:
             self._distance = 0
+            
+            if self.nodes:
+                self._distance += self.problem.distances[0, self.nodes[0]]  # depot to first node
+                self._distance += sum(self.problem.distances[a, b] for a, b in zip(self.nodes, self.nodes[1:]))
+                self._distance += self.problem.distances[self.nodes[-1], 0]  # last node to depot
 
-            self._distance += self.problem.distances[0, self.nodes[0]]  # depot to first node
-            self._distance = sum(self.problem.distances[a, b] for a, b in zip(self.nodes, self.nodes[1:]))
-            self._distance += self.problem.distances[self.nodes[-1], 0]  # last node to depot
-
-        return self._distance
+        return self._distance / self.problem.scale
 
     def set_feasible(self):
         self._feasible = True
@@ -88,7 +92,7 @@ class Route:
         last = len(nodes) - 1
 
         # (pickup position, delivery position) pairs for ride time constraints
-        pairs = [(i, pos[nodes[i].id + n]) for i in range(1, last) if nodes[i].demand > 0]
+        pairs = [(i, pos[nodes[i].id + n] + 1) for i in range(1, last) if nodes[i].demand > 0]
 
         Ei = [n.ready_time for n in nodes]  # earliest start of service
         Li = [n.due_time for n in nodes]  # latest start of service
@@ -165,35 +169,3 @@ class Route:
             return self.set_unfeasible()
 
         return self.set_feasible()
-
-    def best_insertion(self, request: tuple[Node, Node]) -> Route | None:
-        ''' Find the feasible insertion of a request with the smallest distance increase.
-
-        Returns None when the request does not fit in this route. In the IDARP that is not a failure:
-        the request can still be served by the common carrier or by the bus integration.
-        '''
-
-        pickup, delivery = request
-        best_route: Route | None = None
-        best_increase = float('inf')
-
-        for pickup_position in range(len(self.nodes) + 1):
-            for delivery_position in range(pickup_position + 1, len(self.nodes) + 2):
-                nodes = self.nodes.copy()
-
-                nodes.insert(pickup_position, pickup.id)
-                nodes.insert(delivery_position, delivery.id)
-
-                new_route = Route(self.problem, nodes)
-
-                if not new_route.feasible:
-                    continue
-
-                increase = new_route.distance - self.distance
-
-                if increase < best_increase:
-                    best_increase = increase
-                    best_route = new_route
-
-        return best_route
-    

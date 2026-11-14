@@ -1,5 +1,7 @@
-from src.problem import Problem
 from argparse import ArgumentParser
+
+from src.problem import Problem
+from src.construction import construct
 
 if __name__ == '__main__':
     argument_parser = ArgumentParser(description='Load an IDARP instance and print its summary.')
@@ -9,4 +11,9 @@ if __name__ == '__main__':
 
     problem = Problem(args.folder)
     
-    print(problem)
+    print('Problem loaded...')
+    
+    solution = construct(problem)
+    solution.validate()
+    
+    print(solution, solution.cost)
