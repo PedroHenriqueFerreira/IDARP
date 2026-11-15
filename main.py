@@ -8,8 +8,7 @@ from pathlib import Path
 from src.pipeline import Config, run
 from src.problem import Problem
 
-RUNS = 10
-OUT = 'results.csv'
+RUNS = 5
 STAGES = ['construct', 'local_search', 'lns']  # inicial, melhoria, final
 FIELDS = [
     'group', 'instance', 'run', 'seed', 'requests', 'vehicles',
@@ -26,7 +25,7 @@ def main():
         if folder.is_dir() and not any(child.is_dir() for child in folder.iterdir())
     ]
 
-    with open(OUT, 'w', newline='') as file:
+    with open(f'{sys.argv[2]}.csv', 'w', newline='') as file:
         writer = csv.DictWriter(file, fieldnames=FIELDS)
         writer.writeheader()
 
