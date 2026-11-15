@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Generator
+
 from src.problem import Problem
 from src.route import Route
 
@@ -64,12 +66,65 @@ class Solution:
         assert all_requests == set(requests)
     
     @property
+    def outside_requests(self) -> set[int]:
+        ''' Requests served by the carrier or the bus. '''
+
+        return self.carrier_requests | self.integrated_requests
+
+    @property
     def cost(self) -> float:
         if self._cost is None:
             self._cost = 0.0
             
-            self._cost += sum(route.cost() for route in self.routes)
+            self._cost += sum(route.cost for route in self.routes)
             self._cost += sum(self.problem.carrier_cost(k) for k in self.carrier_requests)
             self._cost += sum(self.problem.integration_cost(k) for k in self.integrated_requests)
 
         return self._cost
+
+def best_insertion(problem: Problem, route: Route, k: int) -> tuple[float, Route] | None:
+    ''' Cheapest feasible insertion of request `k` in `route`: (distance increase, new route) or None. '''
+
+    dist = problem.distances
+    nodes = route.nodes
+    m = len(nodes)
+    p, d = k, k + problem.requests
+
+    load = [0] * (m + 1)  # load before each position
+    for t, node_id in enumerate(nodes):
+        load[t + 1] = load[t] + problem.nodes[node_id].demand
+
+    candidates = []
+
+    for i in range(m + 1):
+        if load[i] + 1 > problem.capacity:
+            continue
+
+        prev = nodes[i - 1] if i > 0 else 0
+
+        for j in range(i, m + 1):
+            if j > i and load[j] + 1 > problem.capacity:
+                break
+
+            if j == i:  # pickup and delivery adjacent
+                nxt = nodes[i] if i < m else 0
+                delta = dist[prev, p] + dist[p, d] + dist[d, nxt] - dist[prev, nxt]
+            else:
+                after_p, before_d = nodes[i], nodes[j - 1]
+                after_d = nodes[j] if j < m else 0
+                delta = (
+                    dist[prev, p] + dist[p, after_p] - dist[prev, after_p]
+                    + dist[before_d, d] + dist[d, after_d] - dist[before_d, after_d]
+                )
+
+            candidates.append((delta, i, j))
+
+    for delta, i, j in sorted(candidates):
+        new_route = Route(problem, nodes[:i] + [p] + nodes[i:j] + [d] + nodes[j:])
+
+        if new_route.feasible:
+            return delta, new_route
+
+    return None
+
+

@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -61,6 +62,12 @@ class CostScheme:
     carrier_per_km: float = 2.0 # Common carrier: variable cost v per km
     bus_ticket: float = 3.0 # Bus ticket p_l per integrated request
 
+# Alternatives of a request. Tie-break order: private fleet first.
+ROUTE, INTEGRATION, CARRIER = 0, 1, 2
+
+# Floating point noise tolerated before rounding times to integers (e.g. 120.0000001 stays 120)
+ROUNDING_TOLERANCE = 1e-6
+
 class Problem:
     ''' Class representing a DARP-PFCC instance integrated with public transportation (IDARP).
 
@@ -79,19 +86,15 @@ class Problem:
       - Ids 0..2n are the DARP nodes (0 = depot, 1..n pickups, n+1..2n deliveries).
       - Ids 2n+1.. are bus stops. These ids are the ones used in the full matrices and in the
         bus line / integration files.
-
-    All time and distance values are stored as integers scaled by 10 ** precision.
     '''
 
     def __init__(
         self, 
         folder: str, 
-        precision: int = 2, 
         costs = CostScheme()
     ):
         self.folder = Path(folder).resolve()  # Instance folder
-        self.scale: int = 10 ** precision   # Scale factor for time and distance values
-        self.costs = CostScheme()
+        self.costs = costs
 
         # Codes file
         self.codes: list[str] = []  # codes[id] for every element
@@ -133,13 +136,7 @@ class Problem:
         )
 
     # Helpers
-
-    def _scale_value(self, value: str) -> int:
-        return int(round(float(value) * self.scale))
-
-    def _scale_matrix(self, matrix: np.ndarray) -> np.ndarray:
-        return np.rint(matrix * self.scale).astype(np.int64)
-
+    
     def _read_lines(self, suffix: str) -> list[str]:
         ''' Non-empty, stripped lines of <folder>/<name>_<suffix>.txt '''
         
@@ -186,9 +183,9 @@ class Problem:
 
         self.vehicles = int(cfg['Vehicles'])
         self.requests = int(cfg['Requests'])
-        self.max_duration_route = self._scale_value(cfg['Max-Duration-Route'])
+        self.max_duration_route = float(cfg['Max-Duration-Route'])
         self.capacity = int(cfg['Capacity'])
-        self.max_ride_time = self._scale_value(cfg['Max-Ride-Time'])
+        self.max_ride_time = float(cfg['Max-Ride-Time'])
         self.integration_percentage = float(cfg['Integration-Percentage'])
 
         columns = lines[2].split()
@@ -205,10 +202,12 @@ class Problem:
                 code=row['Code'],
                 x=float(row['Lat']),
                 y=float(row['Lng']),
-                service_time=self._scale_value(row['Service-Time']),
+                service_time=int(round(float(row['Service-Time']))),
                 demand=int(row['Demand']),
-                ready_time=self._scale_value(row['Ei']),
-                due_time=self._scale_value(row['Li']),
+                # Conservative integer rounding (ready up, due down): a schedule valid on the rounded
+                # data is valid on the original, and the CP-SAT model and Route.feasible agree.
+                ready_time=math.ceil(float(row['Ei']) - ROUNDING_TOLERANCE),
+                due_time=math.floor(float(row['Li']) + ROUNDING_TOLERANCE),
                 allowed_to_integrate=bool(int(row['AllowedToIntegrate']))
             ))
 
@@ -219,11 +218,12 @@ class Problem:
         self.bus_stops = [BusStop(i, self.codes[i]) for i in range(n_nodes, n_codes)]
 
     def _load_matrices(self):
-        self.times = self._scale_matrix(self._read_labeled_matrix('TimeMatrix'))
-        self.distances = self._scale_matrix(self._read_labeled_matrix('DistanceMatrix'))
+        # Travel times are rounded up to whole seconds (see the rounding of the time windows)
+        self.times = np.ceil(self._read_labeled_matrix('TimeMatrix') - ROUNDING_TOLERANCE)
+        self.distances = self._read_labeled_matrix('DistanceMatrix')
         
-        self.times_cc = self._scale_matrix(self._read_square_matrix('TimeBC'))
-        self.distances_cc = self._scale_matrix(self._read_square_matrix('DistBC'))
+        self.times_cc = self._read_square_matrix('TimeBC')
+        self.distances_cc = self._read_square_matrix('DistBC')
 
         expected = 2 * self.requests + 2  # nodes + end depot
         
@@ -247,7 +247,7 @@ class Problem:
             row = dict(zip(columns, line.split()))
             
             line_id, bus = int(row['Id-Line']), int(row['Bus'])
-            stop_id, stop_time = int(row['Id']), self._scale_value(row['Time'])
+            stop_id, stop_time = int(row['Id']), float(row['Time'])
 
             assert self.codes[stop_id] == row['Code']
         
@@ -286,8 +286,8 @@ class Problem:
                 bus=bus,
                 boarding_stop=board,
                 landing_stop=land,
-                boarding_time=self._scale_value(tokens[6]),
-                landing_time=self._scale_value(tokens[7]),
+                boarding_time=float(tokens[6]),
+                landing_time=float(tokens[7]),
             )
 
         assert len(self.integrations) == int(lines[1])
@@ -365,6 +365,11 @@ class Problem:
 
     # Utils
 
+    def private_cost(self, i: int, j: int) -> float:
+        ''' Cost of serving nodes i and j with the private fleet  '''
+        
+        return self.costs.private_per_km * self.distances[i, j]
+
     def carrier_feasible(self, k: int) -> bool:
         ''' Whether request `k` can be served by a direct common carrier trip. '''
 
@@ -377,7 +382,7 @@ class Problem:
         - f + v * d(k, n+k) 
         '''
 
-        distance = self.distances_cc[k, k + self.requests] / self.scale
+        distance = self.distances_cc[k, k + self.requests]
         return self.costs.carrier_fixed + self.costs.carrier_per_km * distance
 
     def integration_feasible(self, k: int) -> bool:
@@ -419,6 +424,24 @@ class Problem:
 
         return (
             2 * self.costs.carrier_fixed
-            + self.costs.carrier_per_km * (first + last) / self.scale
+            + self.costs.carrier_per_km * (first + last)
             + self.costs.bus_ticket
         )
+        
+    def fixed_options(self, k: int) -> list[tuple[float, int]]:
+        ''' Alternatives whose cost does not depend on the routes: (cost, tag). '''
+
+        options = []
+
+        if self.carrier_feasible(k):
+            options.append((self.carrier_cost(k), CARRIER))
+
+        if self.integration_feasible(k):
+            options.append((self.integration_cost(k), INTEGRATION))
+
+        return options
+    
+    def outside_cost(self, k: int, carrier: set[int]) -> float:
+        ''' Cost of request `k` served outside the private fleet: carrier if `k` is in `carrier`, else bus. '''
+        
+        return self.carrier_cost(k) if k in carrier else self.integration_cost(k)

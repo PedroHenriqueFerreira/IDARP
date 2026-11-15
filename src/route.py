@@ -4,6 +4,9 @@ from typing import Generator
 
 from src.problem import Problem, Node
 
+# Alternatives of a request. Tie-break order: private fleet first.
+ROUTE, INTEGRATION, CARRIER = 0, 1, 2
+
 class Route:
     ''' Class representing a private fleet vehicle route.
 
@@ -15,7 +18,7 @@ class Route:
         self.problem = problem
         self.nodes = nodes
 
-        self._distance: int | None = None
+        self._cost: float | None = None
         self._feasible: bool | None = None
 
     def __repr__(self) -> str:
@@ -30,22 +33,6 @@ class Route:
     def __getitem__(self, index: int) -> Node:
         return self.problem.nodes[self.nodes[index]]
 
-    def cost(self):
-        return self.problem.costs.private_per_km * self.distance
-
-    @property
-    def distance(self) -> int:
-        ''' Total distance of the route (km, scaled by 10 ** precision) '''
-        if self._distance is None:
-            self._distance = 0
-            
-            if self.nodes:
-                self._distance += self.problem.distances[0, self.nodes[0]]  # depot to first node
-                self._distance += sum(self.problem.distances[a, b] for a, b in zip(self.nodes, self.nodes[1:]))
-                self._distance += self.problem.distances[self.nodes[-1], 0]  # last node to depot
-
-        return self._distance / self.problem.scale
-
     def set_feasible(self):
         self._feasible = True
         return self._feasible
@@ -53,6 +40,15 @@ class Route:
     def set_unfeasible(self):
         self._feasible = False
         return self._feasible
+    
+    @property
+    def cost(self) -> float:
+        ''' Total cost of the route (km) '''
+        if self._cost is None:
+            node_ids = [0, *self.nodes, 0]
+            self._cost = sum(self.problem.private_cost(a, b) for a, b in zip(node_ids, node_ids[1:]))
+
+        return self._cost
 
     @property
     def feasible(self) -> bool:
@@ -81,14 +77,15 @@ class Route:
         # Capacity check
 
         load = 0
-        for node in self:
-            load += node.demand
+        for node in self.nodes:
+            load += self.problem.nodes[node].demand
             if load < 0 or load > self.problem.capacity:
                 return self.set_unfeasible()
 
         # Time windows, ride time, and route duration check using bound propagation
 
-        nodes = [self.problem.nodes[0], *list(self), self.problem.nodes[0]]
+        node_ids = [0, *self.nodes, 0]
+        nodes = [self.problem.nodes[node] for node in node_ids]
         last = len(nodes) - 1
 
         # (pickup position, delivery position) pairs for ride time constraints
@@ -169,3 +166,66 @@ class Route:
             return self.set_unfeasible()
 
         return self.set_feasible()
+
+    def best_insertion(self, k: int) -> tuple[float, Route] | None:
+        ''' Cheapest feasible insertion of request `k`. '''
+
+        dist = self.problem.distances
+        nodes = self.nodes
+        m = len(nodes)
+        p, d = k, k + self.problem.requests
+
+        load = [0] * (m + 1)  # load before each position
+        for t, node_id in enumerate(nodes):
+            load[t + 1] = load[t] + self.problem.nodes[node_id].demand
+
+        candidates = []
+
+        for i in range(m + 1):
+            if load[i] + 1 > self.problem.capacity:
+                continue
+
+            prev = nodes[i - 1] if i > 0 else 0
+
+            for j in range(i, m + 1):
+                if j > i and load[j] + 1 > self.problem.capacity:
+                    break
+
+                if j == i:  # pickup and delivery adjacent
+                    nxt = nodes[i] if i < m else 0
+                    delta = dist[prev, p] + dist[p, d] + dist[d, nxt] - dist[prev, nxt]
+                else:
+                    after_p, before_d = nodes[i], nodes[j - 1]
+                    after_d = nodes[j] if j < m else 0
+                    delta = (
+                        dist[prev, p] + dist[p, after_p] - dist[prev, after_p]
+                        + dist[before_d, d] + dist[d, after_d] - dist[before_d, after_d]
+                    )
+
+                candidates.append((delta, i, j))
+
+        for delta, i, j in sorted(candidates):
+            new_route = Route(self.problem, nodes[:i] + [p] + nodes[i:j] + [d] + nodes[j:])
+
+            if new_route.feasible:
+                return delta, new_route
+
+        return None
+    
+def outside_cost(problem: Problem, k: int, carrier: set[int]) -> float:
+    ''' Cost of request `k` served outside the private fleet: carrier if `k` is in `carrier`, else bus. '''
+
+    return problem.carrier_cost(k) if k in carrier else problem.integration_cost(k)
+
+def fixed_options(problem: Problem, k: int) -> list[tuple[float, int]]:
+    ''' Alternatives whose cost does not depend on the routes: (cost, tag). '''
+
+    options = []
+
+    if problem.carrier_feasible(k):
+        options.append((problem.carrier_cost(k), CARRIER))
+
+    if problem.integration_feasible(k):
+        options.append((problem.integration_cost(k), INTEGRATION))
+
+    return options

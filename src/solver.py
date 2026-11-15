@@ -1,63 +1,156 @@
 from __future__ import annotations
 
-import math
 import os
-import time
+from functools import lru_cache
+from types import SimpleNamespace
+from typing import Collection
 
 import numpy as np
 from ortools.sat.python import cp_model
 
 from src.problem import Problem
-from src.route import Route
-from src.solution import Solution
+from src.solution import Route, Solution
 
 # CP-SAT needs integer coefficients: costs are multiplied by this and rounded.
-# Lower than before (was 10_000): smaller coefficients propagate better. Raise it if you need more precision.
-COST_SCALE = 1_000
+# Smaller coefficients propagate better. Raise it if you need more precision.
+SCALE = 1000
+
+BIG = 1 << 60
 
 
-def _static_arc_filter(problem: Problem) -> np.ndarray:
-    ''' Boolean (N x N) matrix of arcs that can never be used, regardless of the vehicle, set to False.
+class Timeout(RuntimeError):
+    ''' The search stopped at the time limit without a solution and without proving that none exists. '''
 
-    Removes arcs that are infeasible by time window, by load, or by structure (depot -> delivery,
-    pickup -> depot, delivery of k -> pickup of k). Every removed arc is one that the model would
-    have to discover as infeasible during the search, multiplied by the number of vehicles.
+
+def min_chain_times(times: np.ndarray, service: np.ndarray) -> np.ndarray:
+    ''' chain[i, j]: lower bound of (service start at j) - (service start at i) when j is visited after i.
+
+    Shortest path over weights service[i] + times[i, j]; valid without the triangle inequality.
+    '''
+
+    chain = service[:, None] + times
+    np.fill_diagonal(chain, 0)
+
+    for m in range(chain.shape[0]):
+        np.minimum(chain, chain[:, m][:, None] + chain[m, :][None, :], out=chain)
+
+    return chain
+
+
+def _prepare(problem: Problem) -> SimpleNamespace:
+    ''' Numpy view of the instance restricted to the depot, pickups and deliveries (the matrices may be bigger).
+
+    All time data is divided by the greatest common divisor of every time value: the schedule can always be
+    expressed in multiples of it, and smaller domains make the search faster.
     '''
 
     n = problem.requests
-    nodes = problem.nodes
-    capacity = problem.capacity
+    size = 2 * n + 1
+    nodes = problem.nodes[:size]
 
-    size = 2 * n + 1  # depot + pickups + deliveries (the matrices may contain extra nodes)
-    times = np.asarray(problem.times, dtype=np.int64)[:size, :size]
-    nodes = nodes[:size]
+    # The int64 conversion below truncates: the data must already be integral (see `Problem`)
+    assert np.array_equal(problem.times, np.floor(problem.times)), 'times must be integral'
+    assert all(
+        float(node.ready_time).is_integer() and float(node.due_time).is_integer()
+        and float(node.service_time).is_integer()
+        for node in nodes
+    ), 'time windows and service times must be integral'
+
     ready = np.array([node.ready_time for node in nodes], dtype=np.int64)
-    due = np.maximum(ready, np.array([node.due_time for node in nodes], dtype=np.int64))
+    due_raw = np.array([node.due_time for node in nodes], dtype=np.int64)
+    due = np.maximum(ready, due_raw)
+    window_ok = ready <= due_raw
     service = np.array([node.service_time for node in nodes], dtype=np.int64)
     demand = np.array([node.demand for node in nodes], dtype=np.int64)
     demand[0] = 0
 
-    load_lo = np.maximum(0, demand)
-    load_hi = np.minimum(capacity, capacity + demand)
-    load_lo[0] = load_hi[0] = 0
+    times = np.asarray(problem.times, dtype=np.int64)[:size, :size].copy()
+    max_ride = int(problem.max_ride_time)
+    max_duration = int(problem.max_duration_route)
 
-    # Time: leaving i as early as possible must still reach j before its due time
-    ok = (ready + service)[:, None] + times <= due[None, :]
+    g = int(np.gcd.reduce(np.concatenate([ready, due, service, times.ravel()])))
 
-    # Load: load[j] = load[i] + demand[j] must intersect the domain of load[j]
-    ok &= (load_lo[:, None] + demand[None, :] <= load_hi[None, :]) & (
-        load_hi[:, None] + demand[None, :] >= load_lo[None, :]
+    if g > 1:
+        ready //= g
+        due //= g
+        service //= g
+        times //= g
+        max_ride //= g
+        max_duration //= g
+
+    return SimpleNamespace(
+        ready=ready,
+        due=due,
+        service=service,
+        demand=demand,
+        times=times,
+        max_ride=max_ride,
+        max_duration=max_duration,
+        request_ok=window_ok[1:n + 1] & window_ok[n + 1:],
     )
-    ok[:, 0] = (ready + service)[:, None][:, 0] + times[:, 0] <= due[0]  # no load constraint towards the depot
 
-    # Structure
+
+def static_arcs(
+    n: int,
+    service: np.ndarray,
+    demand: np.ndarray,
+    times: np.ndarray,
+    capacity: int,
+    max_ride: int,
+    chain: np.ndarray,
+    need_load: bool = True,
+) -> np.ndarray:
+    ''' Arcs that no feasible route can use for structural, load or ride-time reasons (no time windows). '''
+
+    size = 2 * n + 1
+    ok = np.ones((size, size), dtype=bool)
     ks = np.arange(1, n + 1)
-    ok[0, n + 1:] = False       # depot -> delivery
-    ok[1:n + 1, 0] = False      # pickup -> depot
-    ok[ks + n, ks] = False      # delivery of k -> pickup of k
+
+    # Structure: no depot -> delivery, pickup -> depot, delivery of k -> pickup of k
+    ok[0, n + 1:] = False
+    ok[1:n + 1, 0] = False
+    ok[ks + n, ks] = False
+
+    # Load: load[j] = load[i] + demand[j] must fit the domain of load[j]
+    if need_load:
+        lo = np.maximum(0, demand)
+        hi = np.minimum(capacity, capacity + demand)
+        lo[0] = hi[0] = 0
+        load_ok = (lo[:, None] + demand[None, :] <= hi[None, :]) & (hi[:, None] + demand[None, :] >= lo[None, :])
+        load_ok[:, 0] = True  # no load constraint towards the depot
+        ok &= load_ok
+
+    # Ride time: a node right after pickup k (or right before delivery k + n) makes k ride at least this long
+    after = times[ks, :] + chain[:, ks + n].T  # arc k -> j
+    before = chain[ks, :] - service[ks][:, None] + service[None, :] + times[:, ks + n].T  # arc j -> k + n
+    ok[ks, :] &= after <= max_ride
+    ok[:, ks + n] &= (before <= max_ride).T
+
     np.fill_diagonal(ok, False)
 
     return ok
+
+
+@lru_cache(maxsize=None)
+def feasible_arcs(problem: Problem) -> np.ndarray:
+    ''' Arcs that can belong to some feasible route of the instance (necessary conditions). '''
+
+    size = 2 * problem.requests + 1
+    times = problem.times[:size, :size]
+    service = np.array([node.service_time for node in problem.nodes])
+    ready = np.array([node.ready_time for node in problem.nodes])
+    due = np.array([node.due_time for node in problem.nodes])
+    demand = np.array([node.demand for node in problem.nodes])
+    chain = min_chain_times(times, service)
+
+    arcs = static_arcs(problem.requests, service, demand, times, problem.capacity, problem.max_ride_time, chain)
+    arcs &= ready[:, None] + service[:, None] + times <= due[None, :]  # time windows
+
+    # Route duration: a route using (i, j) lasts at least depot -> i -> j -> depot
+    duration = chain[0, :, None] + (service[:, None] + times) + chain[:, 0][None, :]
+    arcs &= duration <= problem.max_duration_route
+
+    return arcs
 
 
 def _restrict(mask: np.ndarray, n: int, request_ok: np.ndarray) -> tuple[np.ndarray, list[int]]:
@@ -77,6 +170,82 @@ def _restrict(mask: np.ndarray, n: int, request_ok: np.ndarray) -> tuple[np.ndar
         alive = new_alive
 
 
+def _tighten_windows(
+    ready: np.ndarray,
+    due: np.ndarray,
+    service: np.ndarray,
+    times: np.ndarray,
+    arcs: np.ndarray,
+    n: int,
+    max_ride: int,
+    chain: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    ''' Bound propagation over the allowed arcs: earliest / latest arrival at every node.
+
+    A node served by the private fleet has a predecessor and a successor through allowed arcs, so its arrival
+    is at least the best (earliest predecessor + service + travel) and at most the best (latest successor
+    - service - travel). Precedence and ride time between pickup and delivery tighten them further.
+    '''
+
+    ks = np.arange(1, n + 1)
+    ds = ks + n
+    lb, ub = ready.copy(), due.copy()
+
+    for _ in range(100):
+        previous_lb, previous_ub = lb.copy(), ub.copy()
+
+        forward = np.where(arcs, lb[:, None] + service[:, None] + times, BIG)
+        lb[1:] = np.maximum(lb[1:], forward[:, 1:].min(axis=0))
+
+        backward = np.where(arcs, ub[None, :] - service[:, None] - times, -BIG)
+        ub[1:] = np.minimum(ub[1:], backward[1:, :].max(axis=1))
+
+        lb[ds] = np.maximum(lb[ds], lb[ks] + chain[ks, ds])
+        ub[ks] = np.minimum(ub[ks], ub[ds] - chain[ks, ds])
+        lb[ks] = np.maximum(lb[ks], lb[ds] - service[ks] - max_ride)
+        ub[ds] = np.minimum(ub[ds], ub[ks] + service[ks] + max_ride)
+
+        np.minimum(lb, BIG, out=lb)
+        np.maximum(ub, -BIG, out=ub)
+
+        if np.array_equal(lb, previous_lb) and np.array_equal(ub, previous_ub):
+            break
+
+    return lb, ub
+
+
+@lru_cache(maxsize=4)
+def _context(problem: Problem) -> SimpleNamespace:
+    ''' Everything `solve` derives from the instance alone (it never changes between LNS calls).
+
+    The arrays are shared between calls: `solve` must not modify them in place.
+    '''
+
+    n = problem.requests
+    data = _prepare(problem)
+    capacity = problem.capacity
+    need_load = int(np.maximum(0, data.demand[1:n + 1]).sum()) > capacity
+    duration_binding = int(data.due[0] - data.ready[0]) > data.max_duration
+    chain = min_chain_times(data.times, data.service)
+    static = static_arcs(
+        n, data.service, data.demand, data.times, capacity, data.max_ride, chain, need_load
+    )
+
+    return SimpleNamespace(
+        data=data,
+        need_load=need_load,
+        duration_binding=duration_binding,
+        chain=chain,
+        static=static,
+        Tl=data.times.tolist(),
+        Cl=chain.tolist(),
+        ready_l=data.ready.tolist(),
+        due_l=data.due.tolist(),
+        service_l=data.service.tolist(),
+        demand_l=data.demand.tolist(),
+    )
+
+
 def solve(
     problem: Problem,
     initial_solution: Solution,
@@ -86,99 +255,205 @@ def solve(
     workers: int = 0,
     gap: float = 0.0,
     log: bool = False,
-) -> Solution:
+    upper_bound_cut: bool = True,
+    params: dict | None = None,
+    seed: int = 0,
+    deterministic: bool = True,
+    strict: bool = False,
+    hint: bool = True,
+    fixed_requests: Collection[int] = (),
+) -> Solution | None:
     ''' Exact (within the restricted arcs) CP-SAT model for the IDARP, warm-started with `initial_solution`.
 
     Each request is served in exactly one way: by one vehicle of the private fleet, by the common carrier
     or by the bus integration (the last two only if feasible, with fixed costs). Vehicle v can only use the
-    arcs allowed in `matrices[v]` (see `expand_neighbors`), and each vehicle route is a circuit.
+    arcs allowed in `matrices[v]` (see `neighborhoods.expand`), and each vehicle route is a circuit.
     The objective is the total cost: private_per_km * distance + carrier + bus integration.
 
     The matrices must come from `initial_solution` (used routes first), so that its routes are in the model.
 
-    Extra parameters: `workers` (0 = all cores), `gap` (relative gap to stop early, e.g. 0.01) and `log`.
+    Extra parameters: `workers` (0 = all cores), `gap` (relative gap to stop early, e.g. 0.01), `log`,
+    `upper_bound_cut` (adds "cost <= cost of the initial solution" to the model) and `params` (any
+    CpSolverParameters field, e.g. {'linearization_level': 1}).
+
+    Reproducibility: with `deterministic=True` (default) the parallel search is interleaved deterministically,
+    the limit is in deterministic time (not wall clock) and `seed` fixes the random choices, so the same
+    input gives the same solution with the same OR-Tools version. The running time may then differ from
+    `time_limit`. With `deterministic=False` the search is faster but different on every run.
+
+    `fixed_requests` are requests served by routes that stay outside the model (the untouched routes of a
+    route-subset LNS): they get no variables and no alternative here, and `initial_solution` must not contain
+    them. `matrices` then only describe the routes (and idle vehicles) that the model may change.
+
+    With `strict=True` the solver is used to look for an improvement of `initial_solution`. The model is warm
+    started with the initial solution (`hint`) and cut at "cost <= initial cost", so the search is anytime: it
+    starts from the incumbent and improves it, instead of having to find from scratch a solution that is
+    already better than the incumbent. Afterwards:
+      - the best solution is strictly cheaper than the initial one: it is returned;
+      - the solver proves that nothing is cheaper in these arcs (OPTIMAL at the initial cost, or
+        INFEASIBLE): returns `None` (the neighborhood is exhausted);
+      - the limit is reached without finding anything cheaper: raises `Timeout`.
     '''
 
     n = problem.requests
-    nodes = problem.nodes
-    vehicles = range(len(matrices))
+    size = 2 * n + 1
     requests = range(1, n + 1)
     request_of = lambda i: i if i <= n else i - n
 
-    # Plain Python ints: much faster than indexing numpy arrays inside the loops
-    T = np.asarray(problem.times, dtype=np.int64).tolist()
-    D = np.asarray(problem.distances, dtype=np.int64).tolist()
-    ready = [node.ready_time for node in nodes]
-    due = [max(node.ready_time, node.due_time) for node in nodes]
-    service = [node.service_time for node in nodes]
-    demand = [node.demand for node in nodes]
+    fixed = frozenset(fixed_requests)
+    context = _context(problem)
+    data, chain, static = context.data, context.chain, context.static
+    ready, due, service, demand, T = data.ready, data.due, data.service, data.demand, data.times
+    max_ride, max_duration = data.max_ride, data.max_duration
     capacity = problem.capacity
 
-    model = cp_model.CpModel()
+    # Constraints that are redundant for this instance are not generated
 
-    # Arcs and requests each vehicle can use (vectorized, with the static filters of `_static_arc_filter`)
+    need_load = context.need_load
+    duration_binding = context.duration_binding
 
-    static_ok = _static_arc_filter(problem)
-    request_ok = np.array([
-        nodes[r].ready_time <= nodes[r].due_time and nodes[r + n].ready_time <= nodes[r + n].due_time
-        for r in requests
-    ])
+    # Allowed arcs per vehicle (distinct matrices are processed once)
 
-    masks: list[np.ndarray] = []
-    eligible: list[list[int]] = []
+    raw_index: dict[bytes, int] = {}
+    raw_masks: list[np.ndarray] = []
+    raw_of: list[int] = []
 
     for matrix in matrices:
-        size = 2 * n + 1
-        mask, elig = _restrict(static_ok & (matrix[:size, :size] >= 0), n, request_ok)
-        masks.append(mask)
-        eligible.append(elig)
+        mask = matrix[:size, :size] >= 0
+        key = mask.tobytes()
+
+        if key not in raw_index:
+            raw_index[key] = len(raw_masks)
+            raw_masks.append(mask)
+
+        raw_of.append(raw_index[key])
+
+    def restrict_all(lb: np.ndarray, ub: np.ndarray, alive: np.ndarray):
+        arcs = static & (lb[:, None] + service[:, None] + T <= ub[None, :])
+        return [_restrict(mask & arcs, n, alive) for mask in raw_masks]
+
+    # Fixpoint: arcs -> tighter time windows -> fewer arcs / requests -> ...
+
+    lb, ub, alive = ready.copy(), due.copy(), data.request_ok.copy()
+
+    for k in fixed:
+        alive[k - 1] = False  # served by an untouched route: never part of the model
+
+
+    for _ in range(10):
+        results = restrict_all(lb, ub, alive)
+        union = np.zeros((size, size), dtype=bool)
+
+        for sub, _elig in results:
+            union |= sub
+
+        new_lb, new_ub = _tighten_windows(ready, due, service, T, union, n, max_ride, chain)
+        new_alive = alive & (new_lb[1:n + 1] <= new_ub[1:n + 1]) & (new_lb[n + 1:] <= new_ub[n + 1:])
+
+        stable = (
+            np.array_equal(new_alive, alive) and np.array_equal(new_lb, lb) and np.array_equal(new_ub, ub)
+        )
+        lb, ub, alive = new_lb, new_ub, new_alive
+
+        if stable:
+            break
+
+    results = restrict_all(lb, ub, alive)
+
+    # Plain Python ints for the model building loops
+
+    Tl, Cl = context.Tl, context.Cl
+    ready_l, due_l = context.ready_l, context.due_l
+    service_l, demand_l = context.service_l, context.demand_l
+
+    lo, hi = ready.tolist(), due.tolist()  # domain of the arrival time of each node
+    for i in range(1, size):
+        if alive[request_of(i) - 1]:
+            lo[i], hi[i] = int(lb[i]), int(ub[i])
+
+    # Groups of interchangeable vehicles (same allowed arcs); surplus vehicles of a group are dropped,
+    # since a group can never use more vehicles than it has eligible requests
+
+    group_index: dict[bytes, int] = {}
+    group_of: list[int] = []
+    group_members: list[list[int]] = []
+    group_eligible: list[list[int]] = []
+    sub_keys = [sub.tobytes() for sub, _elig in results]
+
+    for v in range(len(matrices)):
+        u = raw_of[v]
+
+        if sub_keys[u] not in group_index:
+            group_index[sub_keys[u]] = len(group_members)
+            group_members.append([])
+            group_eligible.append(results[u][1])
+
+        group_of.append(group_index[sub_keys[u]])
+        group_members[group_of[-1]].append(v)
+
+    kept_members = [members[:len(group_eligible[g])] for g, members in enumerate(group_members)]
+    vehicles = sorted(v for members in kept_members for v in members)
+    mask_of = {v: results[raw_of[v]][0] for v in vehicles}
+    eligible = {v: group_eligible[group_of[v]] for v in vehicles}
+
+    # Only requests that some vehicle can serve need time / load variables (with clustered matrices, as
+    # produced by `neighborhoods.expand`, most requests are outside every cluster and stay with carrier / bus)
+    active = sorted({r for v in vehicles for r in eligible[v]})
+    active_nodes = [i for r in active for i in (r, r + n)]
+
+    model = cp_model.CpModel()
 
     # Variables
 
     y = {(r, v): model.NewBoolVar(f'y_{r}_{v}') for v in vehicles for r in eligible[v]}
-    used = [model.NewBoolVar(f'used_{v}') for v in vehicles]
+    used = {v: model.NewBoolVar(f'used_{v}') for v in vehicles}
 
     x: dict[tuple[int, int, int], cp_model.IntVar] = {}
-    arcs_of: list[list[tuple[int, int, cp_model.IntVar]]] = [[] for _ in vehicles]
-    circuit_arcs: list[list[tuple[int, int, cp_model.IntVar]]] = [[] for _ in vehicles]
-    visited_of: list[list[int]] = []
+    arcs_of: dict[int, list[tuple[int, int, cp_model.IntVar]]] = {v: [] for v in vehicles}
+    circuit_arcs: dict[int, list[tuple[int, int, cp_model.IntVar]]] = {v: [] for v in vehicles}
+    visited_of: dict[int, list[int]] = {}
 
     for v in vehicles:
         visited = [0] + [i for r in eligible[v] for i in (r, r + n)]
-        visited_of.append(visited)
+        visited_of[v] = visited
 
         idx = np.array(visited)
-        sub = masks[v][np.ix_(idx, idx)]
+        sub = mask_of[v][np.ix_(idx, idx)]
 
         for p, q in np.argwhere(sub):
+            p, q = int(p), int(q)
             i, j = visited[p], visited[q]
             var = model.NewBoolVar(f'x_{i}_{j}_{v}')
             x[i, j, v] = var
             arcs_of[v].append((i, j, var))
-            circuit_arcs[v].append((int(p), int(q), var))  # circuit index == position in `visited`
+            circuit_arcs[v].append((p, q, var))  # circuit index == position in `visited`
 
-    carrier = {k: model.NewBoolVar(f'carrier_{k}') for k in requests if problem.carrier_feasible(k)}
-    bus = {k: model.NewBoolVar(f'bus_{k}') for k in requests if problem.integration_feasible(k)}
-    private = {k: model.NewBoolVar(f'private_{k}') for k in requests}
+    free = [k for k in requests if k not in fixed]
+    carrier = {k: model.NewBoolVar(f'carrier_{k}') for k in free if problem.carrier_feasible(k)}
+    bus = {k: model.NewBoolVar(f'bus_{k}') for k in free if problem.integration_feasible(k)}
+    private = {k: model.NewBoolVar(f'private_{k}') for k in active}
 
-    a = {i: model.NewIntVar(ready[i], due[i], f'a_{i}') for i in range(1, 2 * n + 1)}
+    a = {i: model.NewIntVar(lo[i], max(lo[i], hi[i]), f'a_{i}') for i in active_nodes}
     load = {
         i: model.NewIntVar(
-            max(0, demand[i]),
-            min(capacity, capacity + demand[i]),
+            max(0, demand_l[i]),
+            min(capacity, capacity + demand_l[i]),
             f'load_{i}',
         )
-        for i in range(1, 2 * n + 1)
-    }
-    start = [model.NewIntVar(ready[0], due[0], f'start_{v}') for v in vehicles]
-    end = [model.NewIntVar(ready[0], due[0], f'end_{v}') for v in vehicles]
+        for i in active_nodes
+    } if need_load else {}
+
+    if duration_binding:
+        start = {v: model.NewIntVar(ready_l[0], due_l[0], f'start_{v}') for v in vehicles}
+        end = {v: model.NewIntVar(ready_l[0], due_l[0], f'end_{v}') for v in vehicles}
 
     # Each request is served in exactly one way
 
-    for k in requests:
-        model.Add(private[k] == sum(y[k, v] for v in vehicles if (k, v) in y))
-
-        options = [private[k]]
+    for k in free:
+        options = []
+        if k in private:
+            model.Add(private[k] == sum(y[k, v] for v in vehicles if (k, v) in y))
+            options.append(private[k])
         if k in carrier:
             options.append(carrier[k])
         if k in bus:
@@ -192,10 +467,6 @@ def solve(
     # One circuit per vehicle: nodes not visited by the vehicle take a self-loop
 
     for v in vehicles:
-        if not eligible[v]:
-            model.Add(used[v] == 0)
-            continue
-
         visited = visited_of[v]
 
         circuit = [(0, 0, used[v].Not())]
@@ -204,112 +475,212 @@ def solve(
 
         model.AddCircuit(circuit)
 
-        # A used vehicle serves at least one request
-        model.AddBoolOr([y[r, v] for r in eligible[v]]).OnlyEnforceIf(used[v])
+    # Symmetry breaking inside each group: used vehicles first, ordered by their smallest request
 
-    # Symmetry breaking: consecutive vehicles with exactly the same allowed arcs are interchangeable
+    for members in kept_members:
+        for v, w in zip(members, members[1:]):
+            model.Add(used[v] >= used[w])
 
-    for v in range(len(matrices) - 1):
-        if np.array_equal(masks[v], masks[v + 1]):
-            model.Add(used[v] >= used[v + 1])
+        if len(members) > 1:
+            first = {}
 
-    # Time and load propagation along the arcs
+            for v in members:
+                first[v] = model.NewIntVar(1, n + 1, f'first_{v}')
+                model.AddMinEquality(first[v], [(n + 1) - (n + 1 - r) * y[r, v] for r in eligible[v]])
+
+            for v, w in zip(members, members[1:]):
+                model.Add(first[v] < first[w]).OnlyEnforceIf(used[w])
+
+    # Time and load propagation along the arcs (constraints already implied by the domains are skipped)
 
     for (i, j, v), var in x.items():
-        travel = T[i][j]
+        travel = Tl[i][j]
 
         if i == 0:
-            model.Add(a[j] >= start[v] + service[0] + travel).OnlyEnforceIf(var)
-            model.Add(load[j] == demand[j]).OnlyEnforceIf(var)
+            if duration_binding:
+                model.Add(a[j] >= start[v] + service_l[0] + travel).OnlyEnforceIf(var)
+            elif ready_l[0] + service_l[0] + travel > lo[j]:
+                model.Add(a[j] >= ready_l[0] + service_l[0] + travel).OnlyEnforceIf(var)
+
+            if need_load:
+                model.Add(load[j] == demand_l[j]).OnlyEnforceIf(var)
         elif j == 0:
-            model.Add(end[v] >= a[i] + service[i] + travel).OnlyEnforceIf(var)
+            if duration_binding:
+                model.Add(end[v] >= a[i] + service_l[i] + travel).OnlyEnforceIf(var)
+            elif due_l[0] - service_l[i] - travel < hi[i]:
+                model.Add(a[i] <= due_l[0] - service_l[i] - travel).OnlyEnforceIf(var)
         else:
-            model.Add(a[j] >= a[i] + service[i] + travel).OnlyEnforceIf(var)
-            model.Add(load[j] == load[i] + demand[j]).OnlyEnforceIf(var)
+            if lo[j] < hi[i] + service_l[i] + travel:
+                model.Add(a[j] >= a[i] + service_l[i] + travel).OnlyEnforceIf(var)
+
+            if need_load:
+                model.Add(load[j] == load[i] + demand_l[j]).OnlyEnforceIf(var)
 
     # Precedence and ride time, only for requests served by the private fleet
 
     for k in requests:
         d = k + n
 
-        model.Add(a[d] >= a[k] + service[k] + T[k][d]).OnlyEnforceIf(private[k])
-        model.Add(a[d] - a[k] - service[k] <= problem.max_ride_time).OnlyEnforceIf(private[k])
+        if k not in private:
+            continue  # no vehicle can serve it privately
 
-    for v in vehicles:
-        model.Add(end[v] - start[v] <= problem.max_duration_route)
+        if hi[k] + Cl[k][d] > lo[d]:
+            model.Add(a[d] >= a[k] + Cl[k][d]).OnlyEnforceIf(private[k])
 
-    # Objective: total cost, in integer units of 1 / COST_SCALE
+        if hi[d] - lo[k] - service_l[k] > max_ride:
+            model.Add(a[d] - a[k] - service_l[k] <= max_ride).OnlyEnforceIf(private[k])
 
-    unit = problem.costs.private_per_km / problem.scale
-    terms = [(var, round(unit * D[i][j] * COST_SCALE)) for (i, j, _), var in x.items()]
-    terms += [(var, round(problem.carrier_cost(k) * COST_SCALE)) for k, var in carrier.items()]
-    terms += [(var, round(problem.integration_cost(k) * COST_SCALE)) for k, var in bus.items()]
+    if duration_binding:
+        for v in vehicles:
+            model.Add(end[v] - start[v] <= max_duration)
+
+    # Objective: total cost, in integer units of 1 / SCALE
+
+    arc_cost = lambda i, j: round(problem.private_cost(i, j) * SCALE)
+    carrier_cost = { k: round(problem.carrier_cost(k) * SCALE) for k in carrier }
+    bus_cost = { k: round(problem.integration_cost(k) * SCALE) for k in bus }
+
+    terms = [(var, arc_cost(i, j)) for (i, j, _), var in x.items()]
+    terms += [(var, carrier_cost[k]) for k, var in carrier.items()]
+    terms += [(var, bus_cost[k]) for k, var in bus.items()]
     terms = [(var, coef) for var, coef in terms if coef != 0]
 
-    model.Minimize(cp_model.LinearExpr.WeightedSum([t[0] for t in terms], [t[1] for t in terms]))
+    objective = model.NewIntVar(0, sum(coef for _, coef in terms), 'objective')
+    model.Add(objective == cp_model.LinearExpr.WeightedSum([t[0] for t in terms], [t[1] for t in terms]))
+    model.Minimize(objective)
 
-    # Hint: the complete initial solution (its routes are the first vehicles, as in `expand_neighbors`).
-    # A partial hint (only arcs) often cannot be completed by the solver, so times and loads are hinted too.
+    # Hint: the complete initial solution (its routes are the first vehicles, as in `neighborhoods.expand`).
+    # Routes of interchangeable vehicles are sorted by their smallest request to respect the symmetry breaking.
 
     hint_routes = [route for route in initial_solution.routes if route.nodes][:len(matrices)]
-    hint_arcs = {
-        (u, w, v)
-        for v, route in enumerate(hint_routes)
-        for u, w in zip([0, *route.nodes], [*route.nodes, 0])
-    }
-    hint_requests = {(request_of(i), v) for v, route in enumerate(hint_routes) for i in route.nodes}
-    hint_private = {k for k, _ in hint_requests}
-
-    a_hint = {i: ready[i] for i in range(1, 2 * n + 1)}
-    load_hint = {i: max(0, demand[i]) for i in range(1, 2 * n + 1)}
-    start_hint = [ready[0]] * len(matrices)
-    end_hint = [ready[0]] * len(matrices)
+    routes_by_group: dict[int, list[list[int]]] = {}
 
     for v, route in enumerate(hint_routes):
-        # Earliest schedule along the route (clipped to the windows); `repair_hint` fixes small violations
-        leave = ready[0] + service[0]
-        previous = 0
-        current_load = 0
+        routes_by_group.setdefault(group_of[v], []).append(list(route.nodes))
 
-        for node in route.nodes:
-            a_hint[node] = min(due[node], max(ready[node], leave + T[previous][node]))
-            current_load += demand[node]
-            load_hint[node] = min(max(current_load, max(0, demand[node])), min(capacity, capacity + demand[node]))
-            leave = a_hint[node] + service[node]
-            previous = node
+    hint_assign: dict[int, list[int]] = {}
 
-        end_hint[v] = min(due[0], max(ready[0], leave + T[previous][0]))
+    for g, group_routes in routes_by_group.items():
+        group_routes.sort(key=lambda nodes: min(request_of(i) for i in nodes))
 
-    for key, var in x.items():
-        model.AddHint(var, int(key in hint_arcs))
-    for key, var in y.items():
-        model.AddHint(var, int(key in hint_requests))
-    for k, var in private.items():
-        model.AddHint(var, int(k in hint_private))
-    for v in vehicles:
-        model.AddHint(used[v], int(v < len(hint_routes)))
-        model.AddHint(start[v], start_hint[v])
-        model.AddHint(end[v], end_hint[v])
-    for i in a:
-        model.AddHint(a[i], a_hint[i])
-        model.AddHint(load[i], load_hint[i])
-    for k, var in carrier.items():
-        model.AddHint(var, int(k in initial_solution.carrier_requests))
-    for k, var in bus.items():
-        model.AddHint(var, int(k in initial_solution.integrated_requests))
+        for v, nodes in zip(group_members[g], group_routes):
+            hint_assign[v] = nodes
+
+    hint_arcs = {
+        (u, w, v)
+        for v, nodes in hint_assign.items()
+        for u, w in zip([0, *nodes], [*nodes, 0])
+    }
+    hint_requests = {(request_of(i), v) for v, nodes in hint_assign.items() for i in nodes}
+    hint_private = {k for k, _ in hint_requests}
+
+    if hint:
+        a_hint = {i: lo[i] for i in range(1, size)}
+        load_hint = {i: max(0, demand_l[i]) for i in range(1, size)}
+        end_hint = {v: ready_l[0] for v in vehicles}
+
+        for v, nodes in hint_assign.items():
+            # Earliest schedule along the route (clipped to the domains)
+            leave = ready_l[0] + service_l[0]
+            previous = 0
+            current_load = 0
+
+            for node in nodes:
+                a_hint[node] = min(hi[node], max(lo[node], leave + Tl[previous][node]))
+                current_load += demand_l[node]
+                load_hint[node] = min(
+                    max(current_load, max(0, demand_l[node])), min(capacity, capacity + demand_l[node])
+                )
+                leave = a_hint[node] + service_l[node]
+                previous = node
+
+            end_hint[v] = min(due_l[0], max(ready_l[0], leave + Tl[previous][0]))
+
+        for key, var in x.items():
+            model.AddHint(var, int(key in hint_arcs))
+        for key, var in y.items():
+            model.AddHint(var, int(key in hint_requests))
+        for k, var in private.items():
+            model.AddHint(var, int(k in hint_private))
+        for v in vehicles:
+            model.AddHint(used[v], int(v in hint_assign))
+            if duration_binding:
+                model.AddHint(start[v], ready_l[0])
+                model.AddHint(end[v], end_hint[v])
+        for i in a:
+            model.AddHint(a[i], a_hint[i])
+        for i in load:
+            model.AddHint(load[i], load_hint[i])
+        for k, var in carrier.items():
+            model.AddHint(var, int(k in initial_solution.carrier_requests))
+        for k, var in bus.items():
+            model.AddHint(var, int(k in initial_solution.integrated_requests))
+
+    # Upper bound: the initial solution is feasible, so the optimum cannot cost more than it
+
+    initial_cost = None
+
+    if upper_bound_cut or strict:
+        carrier_set = set(initial_solution.carrier_requests)
+        bus_set = set(initial_solution.integrated_requests)
+        complete = (
+            all(key in x for key in hint_arcs)
+            and all(key in y for key in hint_requests)
+            and carrier_set <= set(carrier)
+            and bus_set <= set(bus)
+            and len(hint_private) + len(carrier_set) + len(bus_set) == len(free)
+            and hint_private | carrier_set | bus_set == set(free)
+        )
+
+        if complete:
+            initial_cost = (
+                sum(arc_cost(i, j) for i, j, _ in hint_arcs)
+                + sum(carrier_cost[k] for k in carrier_set)
+                + sum(bus_cost[k] for k in bus_set)
+            )
+            model.Add(objective <= initial_cost)
+        elif strict:
+            raise RuntimeError('The initial solution is not in the model, so no strict improvement can be proved')
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = time_limit
+    solver.parameters.random_seed = seed
     solver.parameters.num_workers = workers or os.cpu_count() or 8
+
+    if deterministic:
+        # Wall-clock limits make the stopping point depend on machine load, so the limit is deterministic time;
+        # the wall-clock limit is only a safety net
+        solver.parameters.interleave_search = True
+        solver.parameters.max_deterministic_time = time_limit
+        solver.parameters.max_time_in_seconds = 10 * time_limit
+    else:
+        solver.parameters.max_time_in_seconds = time_limit
+
     solver.parameters.relative_gap_limit = gap
     solver.parameters.log_search_progress = log
-    solver.parameters.repair_hint = True
+    # `repair_hint` is off: it can abort the process ("Check failed: heuristics.fixed_search != nullptr")
+    # when the repair model is unsatisfiable. It can be re-enabled with `params={'repair_hint': True}`.
     solver.parameters.hint_conflict_limit = 100
+    solver.parameters.linearization_level = 2
+
+    for name, value in (params or {}).items():
+        setattr(solver.parameters, name, value)
 
     status = solver.Solve(model)
 
+    if status == cp_model.INFEASIBLE and strict:
+        return None  # nothing strictly better than the initial solution inside these arcs
+
+    if status == cp_model.UNKNOWN:
+        raise Timeout('Time limit reached without a solution')
+
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise RuntimeError('No solution found (infeasible model or time limit reached without a solution)')
+        raise RuntimeError('No solution found (the model is infeasible)')
+
+    if strict and initial_cost is not None and round(solver.ObjectiveValue()) >= initial_cost:
+        if status == cp_model.OPTIMAL:
+            return None  # proved: nothing cheaper than the initial solution inside these arcs
+
+        raise Timeout('Time limit reached without improving the initial solution')
 
     routes: list[Route] = []
 
@@ -333,394 +704,4 @@ def solve(
         routes,
         {k for k, var in carrier.items() if solver.BooleanValue(var)},
         {k for k, var in bus.items() if solver.BooleanValue(var)},
-    )
-
-
-class _RouteOracle:
-    ''' Subproblem: best route of ONE vehicle that serves exactly a given set of requests.
-
-    The vehicle can only use the arcs allowed in its group mask (the same arcs as the monolithic model).
-    Results are cached by (group, set of requests): vehicles with the same mask share the cache.
-    '''
-
-    def __init__(self, problem: Problem, group_masks: list[np.ndarray], time_limit: float):
-        n = problem.requests
-        size = 2 * n + 1
-        nodes = problem.nodes[:size]
-
-        unit = problem.costs.private_per_km / problem.scale
-        distances = np.asarray(problem.distances, dtype=np.int64)[:size, :size]
-
-        self.problem = problem
-        self.n = n
-        self.masks = group_masks
-        self.time_limit = time_limit
-        self.T = np.asarray(problem.times, dtype=np.int64)[:size, :size].tolist()
-        self.cost_matrix = np.rint(unit * distances * COST_SCALE).astype(np.int64)
-        self.C = self.cost_matrix.tolist()
-        self.ready = [node.ready_time for node in nodes]
-        self.due = [max(node.ready_time, node.due_time) for node in nodes]
-        self.service = [node.service_time for node in nodes]
-        self.demand = [node.demand for node in nodes]
-        self.cache: dict[tuple[int, frozenset[int]], tuple[bool, int, list[int]]] = {}
-        self.calls = 0
-
-    def solve(self, group: int, requests: frozenset[int]) -> tuple[bool, int, list[int]]:
-        ''' Returns (feasible, cost in 1 / COST_SCALE units, route nodes). '''
-
-        key = (group, requests)
-
-        if key not in self.cache:
-            self.cache[key] = self._solve(group, requests)
-
-        return self.cache[key]
-
-    def minimal_infeasible(self, group: int, requests: frozenset[int]) -> frozenset[int]:
-        ''' Deletion filter: smallest subset (not necessarily minimum) that is still infeasible. '''
-
-        core = set(requests)
-
-        for k in sorted(requests):
-            trial = core - {k}
-
-            if trial and not self.solve(group, frozenset(trial))[0]:
-                core = trial
-
-        return frozenset(core)
-
-    def _solve(self, group: int, requests: frozenset[int]) -> tuple[bool, int, list[int]]:
-        self.calls += 1
-
-        n = self.n
-        problem = self.problem
-        ready, due, service, demand, T, C = self.ready, self.due, self.service, self.demand, self.T, self.C
-
-        visited = [0] + [i for r in sorted(requests) for i in (r, r + n)]
-        position = {node: p for p, node in enumerate(visited)}
-        idx = np.array(visited)
-        pairs = np.argwhere(self.masks[group][np.ix_(idx, idx)])
-
-        if len(pairs) == 0:
-            return False, 0, []
-
-        model = cp_model.CpModel()
-
-        x = {}
-        circuit = []
-        for p, q in pairs:
-            p, q = int(p), int(q)
-            x[p, q] = model.NewBoolVar(f'x_{p}_{q}')
-            circuit.append((p, q, x[p, q]))
-
-        model.AddCircuit(circuit)
-
-        a = {node: model.NewIntVar(ready[node], due[node], f'a_{node}') for node in visited[1:]}
-        load = {
-            node: model.NewIntVar(
-                max(0, demand[node]), min(problem.capacity, problem.capacity + demand[node]), f'load_{node}'
-            )
-            for node in visited[1:]
-        }
-        start = model.NewIntVar(ready[0], due[0], 'start')
-        end = model.NewIntVar(ready[0], due[0], 'end')
-
-        for (p, q), var in x.items():
-            i, j = visited[p], visited[q]
-
-            if i == 0:
-                model.Add(a[j] >= start + service[0] + T[0][j]).OnlyEnforceIf(var)
-                model.Add(load[j] == demand[j]).OnlyEnforceIf(var)
-            elif j == 0:
-                model.Add(end >= a[i] + service[i] + T[i][0]).OnlyEnforceIf(var)
-            else:
-                model.Add(a[j] >= a[i] + service[i] + T[i][j]).OnlyEnforceIf(var)
-                model.Add(load[j] == load[i] + demand[j]).OnlyEnforceIf(var)
-
-        for k in requests:
-            d = k + n
-            model.Add(a[d] >= a[k] + service[k] + T[k][d])
-            model.Add(a[d] - a[k] - service[k] <= problem.max_ride_time)
-
-        model.Add(end - start <= problem.max_duration_route)
-
-        model.Minimize(sum(C[visited[p]][visited[q]] * var for (p, q), var in x.items()))
-
-        solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = self.time_limit
-        solver.parameters.num_workers = 1
-
-        status = solver.Solve(model)
-
-        if status == cp_model.INFEASIBLE:
-            return False, 0, []
-
-        if status != cp_model.OPTIMAL:
-            raise RuntimeError(
-                f'Subproblem not solved to optimality (status {solver.StatusName(status)}) '
-                f'for requests {sorted(requests)}: increase `sub_time_limit`'
-            )
-
-        successor = {visited[p]: visited[q] for (p, q), var in x.items() if solver.BooleanValue(var)}
-        route, current = [], successor[0]
-
-        while current != 0:
-            route.append(current)
-            current = successor[current]
-
-        return True, int(round(solver.ObjectiveValue())), route
-
-
-def solve(
-    problem: Problem,
-    initial_solution: Solution,
-    matrices: list[np.ndarray],
-    time_limit: float = 120.0,
-    max_integrated: int | None = None,
-    workers: int = 0,
-    gap: float = 0.0,
-    log: bool = False,
-    monotone: bool = True,
-    sub_time_limit: float = 60.0,
-) -> Solution:
-    ''' Logic-based Benders decomposition for the IDARP (same inputs/outputs as `solver.solve`).
-
-    Master: assigns every request to a vehicle, the common carrier or the bus integration, with one variable
-    `theta[v]` that under-estimates the routing cost of vehicle v (no arcs, no times, no loads).
-    Subproblem: for each used vehicle, the best route serving exactly its requests (feasibility + cost).
-    Cuts (added to the master every iteration, CP-SAT has no lazy callbacks so it is re-solved):
-      - infeasible set S: no vehicle of the group can serve (a minimal infeasible subset of) S;
-      - feasible set S with cost c: theta >= c when S is served.
-    Every master solution with cost >= the incumbent is cut off, so the loop stops when the master is
-    infeasible (incumbent proved optimal), at the relative `gap`, or at `time_limit` (best incumbent returned).
-
-    `monotone=True` assumes that removing a request from a feasible route keeps it feasible and does not
-    increase its cost (true when times and distances satisfy the triangle inequality and the allowed arcs
-    allow the shortcuts). It gives strong cuts (supersets of S are also infeasible / at least as expensive),
-    and every solution returned is feasible anyway, but optimality within the restricted arcs is only
-    guaranteed if the assumption holds. `monotone=False` uses exact-set no-good cuts, always valid but slow.
-    '''
-
-    started = time.monotonic()
-    deadline = started + time_limit
-
-    n = problem.requests
-    size = 2 * n + 1
-    vehicles = range(len(matrices))
-    requests = range(1, n + 1)
-    request_of = lambda i: i if i <= n else i - n
-
-    # Allowed arcs, eligible requests and groups of interchangeable vehicles (same allowed arcs)
-
-    static_ok = _static_arc_filter(problem)
-    request_ok = np.array([
-        problem.nodes[r].ready_time <= problem.nodes[r].due_time
-        and problem.nodes[r + n].ready_time <= problem.nodes[r + n].due_time
-        for r in requests
-    ])
-
-    eligible: list[list[int]] = []
-    group_of: list[int] = []
-    group_masks: list[np.ndarray] = []
-    group_members: list[list[int]] = []
-    seen: dict[bytes, int] = {}
-
-    for v, matrix in enumerate(matrices):
-        mask, elig = _restrict(static_ok & (matrix[:size, :size] >= 0), n, request_ok)
-        key = mask.tobytes()
-
-        if key not in seen:
-            seen[key] = len(group_masks)
-            group_masks.append(mask)
-            group_members.append([])
-
-        group_of.append(seen[key])
-        group_members[seen[key]].append(v)
-        eligible.append(elig)
-
-    oracle = _RouteOracle(problem, group_masks, sub_time_limit)
-
-    # Master model
-
-    model = cp_model.CpModel()
-
-    y = {(r, v): model.NewBoolVar(f'y_{r}_{v}') for v in vehicles for r in eligible[v]}
-    used = [model.NewBoolVar(f'used_{v}') for v in vehicles]
-    theta_ub = int(oracle.cost_matrix.max()) * size + 1
-    theta = [model.NewIntVar(0, theta_ub, f'theta_{v}') for v in vehicles]
-
-    carrier_cost = {k: round(problem.carrier_cost(k) * COST_SCALE) for k in requests if problem.carrier_feasible(k)}
-    bus_cost = {k: round(problem.integration_cost(k) * COST_SCALE) for k in requests if problem.integration_feasible(k)}
-    carrier = {k: model.NewBoolVar(f'carrier_{k}') for k in carrier_cost}
-    bus = {k: model.NewBoolVar(f'bus_{k}') for k in bus_cost}
-
-    for k in requests:
-        options = [y[k, v] for v in vehicles if (k, v) in y]
-        if k in carrier:
-            options.append(carrier[k])
-        if k in bus:
-            options.append(bus[k])
-
-        model.AddExactlyOne(options)
-
-    if max_integrated is not None:
-        model.Add(sum(bus.values()) <= max_integrated)
-
-    for v in vehicles:
-        for r in eligible[v]:
-            model.Add(y[r, v] <= used[v])
-
-        model.Add(used[v] <= sum(y[r, v] for r in eligible[v]))
-        model.Add(theta[v] == 0).OnlyEnforceIf(used[v].Not())
-
-    for v in range(len(matrices) - 1):
-        if group_of[v] == group_of[v + 1]:
-            model.Add(used[v] >= used[v + 1])
-
-    if monotone:
-        # Single-request routes: infeasible singletons are removed, feasible ones give a lower bound on theta
-        for gid, members in enumerate(group_members):
-            for k in eligible[members[0]]:
-                feasible, cost, _ = oracle.solve(gid, frozenset([k]))
-
-                for w in members:
-                    if not feasible:
-                        model.Add(y[k, w] == 0)
-                    else:
-                        model.Add(theta[w] >= cost * y[k, w])
-
-    total_ub = theta_ub * len(matrices) + sum(carrier_cost.values()) + sum(bus_cost.values()) + 1
-    z = model.NewIntVar(0, total_ub, 'z')
-    model.Add(z == sum(theta) + sum(c * carrier[k] for k, c in carrier_cost.items())
-              + sum(c * bus[k] for k, c in bus_cost.items()))
-    model.Minimize(z)
-
-    # Cuts
-
-    added: set = set()
-
-    def add_cost_cut(gid: int, served: frozenset[int], cost: int) -> None:
-        if (key := ('cost', gid, served)) in added:
-            return
-        added.add(key)
-
-        for w in group_members[gid]:
-            expr = sum(y[k, w] for k in served)
-            if not monotone:
-                expr = expr - sum(y[k, w] for k in eligible[w] if k not in served)
-
-            model.Add(theta[w] >= cost * expr - cost * (len(served) - 1))
-
-    def add_infeasibility_cut(gid: int, served: frozenset[int]) -> None:
-        core = oracle.minimal_infeasible(gid, served) if monotone else served
-
-        if (key := ('infeasible', gid, core)) in added:
-            return
-        added.add(key)
-
-        for w in group_members[gid]:
-            expr = sum(y[k, w] for k in core)
-            if not monotone:
-                expr = expr - sum(y[k, w] for k in eligible[w] if k not in core)
-
-            model.Add(expr <= len(core) - 1)
-
-    def evaluate(sets: list[frozenset[int]], carrier_set: set[int], bus_set: set[int]):
-        ''' Solves the subproblems of an assignment and adds the cuts. Returns (total cost, routes) or None. '''
-
-        total = sum(carrier_cost[k] for k in carrier_set) + sum(bus_cost[k] for k in bus_set)
-        routes: list[list[int]] = []
-        feasible = True
-
-        for v, served in enumerate(sets):
-            if not served:
-                continue
-
-            ok, cost, route = oracle.solve(group_of[v], served)
-
-            if ok:
-                total += cost
-                routes.append(route)
-                add_cost_cut(group_of[v], served, cost)
-            else:
-                feasible = False
-                add_infeasibility_cut(group_of[v], served)
-
-        return (total, routes) if feasible else None
-
-    # Incumbent from the initial solution (its routes are the first vehicles, as in `expand_neighbors`)
-
-    incumbent: tuple[int, list[list[int]], set[int], set[int]] | None = None
-    lower_bound = 0
-
-    hint_routes = [route for route in initial_solution.routes if route.nodes][:len(matrices)]
-    hint_sets = [frozenset(request_of(i) for i in route.nodes) for route in hint_routes]
-    hint_sets += [frozenset()] * (len(matrices) - len(hint_sets))
-
-    if all(served <= set(eligible[v]) for v, served in enumerate(hint_sets)):
-        result = evaluate(hint_sets, set(initial_solution.carrier_requests), set(initial_solution.integrated_requests))
-
-        if result is not None:
-            incumbent = (result[0], result[1], set(initial_solution.carrier_requests),
-                         set(initial_solution.integrated_requests))
-            model.Add(z <= incumbent[0] - 1)
-
-    if log:
-        print(f'[benders] initial incumbent: {incumbent[0] if incumbent else None}, subproblems: {oracle.calls}')
-
-    # Benders loop
-
-    iteration = 0
-    status_text = 'time limit'
-
-    while (remaining := deadline - time.monotonic()) > 0:
-        iteration += 1
-
-        solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = remaining
-        solver.parameters.num_workers = workers or 0
-        status = solver.Solve(model)
-
-        if status == cp_model.INFEASIBLE:
-            status_text = 'optimal (master infeasible below the incumbent)'
-            break
-
-        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            break
-
-        if status == cp_model.OPTIMAL:
-            lower_bound = max(lower_bound, int(round(solver.ObjectiveValue())))
-        else:
-            lower_bound = max(lower_bound, math.ceil(solver.BestObjectiveBound()))
-
-        sets = [frozenset(r for r in eligible[v] if solver.BooleanValue(y[r, v])) for v in vehicles]
-        carrier_set = {k for k, var in carrier.items() if solver.BooleanValue(var)}
-        bus_set = {k for k, var in bus.items() if solver.BooleanValue(var)}
-
-        result = evaluate(sets, carrier_set, bus_set)
-
-        if result is not None and (incumbent is None or result[0] < incumbent[0]):
-            incumbent = (result[0], result[1], carrier_set, bus_set)
-            model.Add(z <= incumbent[0] - 1)
-
-        if log:
-            print(
-                f'[benders] iter {iteration}: lb {lower_bound} ub {incumbent[0] if incumbent else None} '
-                f'subproblems {oracle.calls} cuts {len(added)} elapsed {time.monotonic() - started:.1f}s'
-            )
-
-        if incumbent is not None and incumbent[0] - lower_bound <= gap * incumbent[0]:
-            status_text = f'gap <= {gap}'
-            break
-
-    if incumbent is None:
-        raise RuntimeError('No solution found (infeasible model or time limit reached without a solution)')
-
-    if log:
-        print(f'[benders] finished: {status_text}, cost {incumbent[0]}, lb {lower_bound}, iterations {iteration}')
-
-    return Solution(
-        problem,
-        [Route(problem, route) for route in incumbent[1]],
-        incumbent[2],
-        incumbent[3],
     )
